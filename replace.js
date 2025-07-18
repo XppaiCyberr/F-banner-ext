@@ -4,6 +4,27 @@ let banners = null;
 let lastUrl = window.location.href;
 let urlCheckTimeout = null;
 
+// IndexedDB setup for blob storage
+const DB_NAME = 'BannerCache';
+const DB_VERSION = 1;
+const STORE_NAME = 'banners';
+
+function initDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'username' });
+      }
+    };
+  });
+}
+
 function getUsernameFromURL() {
   const match = window.location.pathname.match(/^\/([^\/?#]+)/);
   return match ? match[1] : null;
@@ -11,22 +32,53 @@ function getUsernameFromURL() {
 
 async function getCachedBanner(username) {
   try {
-    const result = await chrome.storage.local.get(`banner_${username}`);
-    return result[`banner_${username}`] || null;
+    const db = await initDB();
+    const transaction = db.transaction([STORE_NAME], 'readonly');
+    const store = transaction.objectStore(STORE_NAME);
+    
+    return new Promise((resolve, reject) => {
+      const request = store.get(username);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const result = request.result;
+        if (result && result.blob) {
+          // Create object URL from cached blob
+          const objectUrl = URL.createObjectURL(result.blob);
+          resolve({
+            url: result.originalUrl,
+            dataUrl: objectUrl,
+            timestamp: result.timestamp,
+            isBlob: true
+          });
+        } else {
+          resolve(null);
+        }
+      };
+    });
   } catch (error) {
     console.warn('Failed to get cached banner:', error);
     return null;
   }
 }
 
-async function setCachedBanner(username, url, dataUrl) {
-  const cacheData = {
-    url: url,
-    dataUrl: dataUrl,
-    timestamp: Date.now()
-  };
+async function setCachedBanner(username, url, blob) {
   try {
-    await chrome.storage.local.set({ [`banner_${username}`]: cacheData });
+    const db = await initDB();
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    
+    const cacheData = {
+      username: username,
+      originalUrl: url,
+      blob: blob,
+      timestamp: Date.now()
+    };
+    
+    return new Promise((resolve, reject) => {
+      const request = store.put(cacheData);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve();
+    });
   } catch (error) {
     console.warn('Failed to cache banner:', error);
   }
@@ -38,21 +90,24 @@ function downloadAndCacheBanner(username, imgUrl) {
     img.crossOrigin = 'anonymous';
     
     img.onload = function() {
-      // Convert to base64 for storage
+      // Create canvas and convert to blob
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
       canvas.width = img.width;
       canvas.height = img.height;
       ctx.drawImage(img, 0, 0);
       
-      try {
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-        setCachedBanner(username, imgUrl, dataUrl);
-        resolve(dataUrl);
-      } catch (error) {
-        console.warn('Failed to cache banner:', error);
-        resolve(imgUrl); // Fallback to original URL
-      }
+      // Convert to blob (much more efficient than base64)
+      canvas.toBlob(async (blob) => {
+        try {
+          await setCachedBanner(username, imgUrl, blob);
+          const objectUrl = URL.createObjectURL(blob);
+          resolve(objectUrl);
+        } catch (error) {
+          console.warn('Failed to cache banner:', error);
+          resolve(imgUrl); // Fallback to original URL
+        }
+      }, 'image/jpeg', 0.8);
     };
     
     img.onerror = function() {
@@ -72,6 +127,7 @@ async function replaceBanner(username, imgUrl) {
 
   if (target && imgUrl) {
     let finalImgSrc = imgUrl;
+    let shouldRevokeUrl = false;
     
     // Check storage first
     const cached = await getCachedBanner(username);
@@ -79,11 +135,19 @@ async function replaceBanner(username, imgUrl) {
     if (cached && cached.url === imgUrl) {
       // Use cached version
       finalImgSrc = cached.dataUrl;
+      shouldRevokeUrl = cached.isBlob; // Only revoke if it's a blob URL
       console.log('Using cached banner for:', username);
     } else {
       // Download and cache new banner
       console.log('Downloading new banner for:', username);
       finalImgSrc = await downloadAndCacheBanner(username, imgUrl);
+      shouldRevokeUrl = finalImgSrc.startsWith('blob:'); // Check if it's a blob URL
+    }
+    
+    // Clean up previous blob URL if exists
+    const existingImg = document.querySelector("#body\\:main img[alt='Custom Banner']");
+    if (existingImg && existingImg.src.startsWith('blob:')) {
+      URL.revokeObjectURL(existingImg.src);
     }
     
     const img = document.createElement("img");
@@ -91,6 +155,19 @@ async function replaceBanner(username, imgUrl) {
     img.alt = "Custom Banner";
     img.className = "aspect-[3/1] size-full object-cover object-center";
     img.src = finalImgSrc;
+    
+    // Add cleanup when image is no longer needed
+    if (shouldRevokeUrl) {
+      img.addEventListener('load', () => {
+        // Set a timeout to revoke the URL after the image is loaded and displayed
+        setTimeout(() => {
+          if (img.src.startsWith('blob:') && !document.contains(img)) {
+            URL.revokeObjectURL(img.src);
+          }
+        }, 1000);
+      });
+    }
+    
     target.replaceWith(img);
     return true;
   }
@@ -185,15 +262,29 @@ function checkUrlChange() {
   }
 }
 
+function cleanupBlobUrls() {
+  // Clean up any blob URLs when navigating away
+  const customBanners = document.querySelectorAll('#body\\:main img[alt="Custom Banner"]');
+  customBanners.forEach(img => {
+    if (img.src.startsWith('blob:')) {
+      URL.revokeObjectURL(img.src);
+    }
+  });
+}
+
 function monitorURLChange() {
   // Use a more efficient approach with throttled checking
   const throttledCheck = () => {
     if (urlCheckTimeout) clearTimeout(urlCheckTimeout);
-    urlCheckTimeout = setTimeout(checkUrlChange, 100); // Throttle to 100ms
+    urlCheckTimeout = setTimeout(() => {
+      cleanupBlobUrls(); // Clean up before checking URL change
+      checkUrlChange();
+    }, 100); // Throttle to 100ms
   };
 
   // Listen for navigation events
   window.addEventListener('popstate', throttledCheck);
+  window.addEventListener('beforeunload', cleanupBlobUrls);
   
   // Backup observer with reduced sensitivity
   const observer = new MutationObserver(throttledCheck);

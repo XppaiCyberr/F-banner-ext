@@ -1,7 +1,7 @@
 {
-    "manifest_version": 3,
-    "name": "Farcaster Custom Banners",
-    "version": "1.4",
+  "manifest_version": 3,
+  "name": "Farcaster Custom Banners",
+  "version": "1.5",
     "author": "XppaiCyberr",
     "description": "Replaces Farcaster profile banners for non PRO users",
     "permissions": [
