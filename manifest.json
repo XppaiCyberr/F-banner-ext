@@ -1,0 +1,21 @@
+{
+    "manifest_version": 3,
+    "name": "Farcaster Custom Banners",
+    "version": "1.4",
+    "author": "XppaiCyberr",
+    "description": "Replaces Farcaster profile banners for non PRO users",
+    "permissions": [
+      "storage"
+    ],
+    "content_scripts": [
+      {
+        "matches": ["https://farcaster.xyz/*"],
+        "js": ["replace.js"],
+        "run_at": "document_idle"
+      }
+    ],
+    "host_permissions": [
+      "https://raw.githubusercontent.com/XppaiCyberr/farcaster-banner/refs/heads/main/banner.json"
+    ]
+  }
+  
