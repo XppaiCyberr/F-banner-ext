@@ -30,6 +30,15 @@ function getUsernameFromURL() {
   return match ? match[1] : null;
 }
 
+function isValidImageUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.protocol === 'http:' || urlObj.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 async function getCachedBanner(username) {
   try {
     const db = await initDB();
@@ -86,36 +95,100 @@ async function setCachedBanner(username, url, blob) {
 
 function downloadAndCacheBanner(username, imgUrl) {
   return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    
-    img.onload = function() {
-      // Create canvas and convert to blob
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-      
-      // Convert to blob (much more efficient than base64)
-      canvas.toBlob(async (blob) => {
+    // First, try to fetch the image to check if it's accessible
+    fetch(imgUrl, { mode: 'cors' })
+      .then(response => {
+        if (!response.ok) throw new Error('Fetch failed');
+        return response.blob();
+      })
+      .then(async (blob) => {
+        // Successfully fetched as blob, cache it directly
         try {
           await setCachedBanner(username, imgUrl, blob);
           const objectUrl = URL.createObjectURL(blob);
+          console.log('Successfully cached banner via fetch for:', username);
           resolve(objectUrl);
         } catch (error) {
-          console.warn('Failed to cache banner:', error);
-          resolve(imgUrl); // Fallback to original URL
+          console.warn('Failed to cache fetched banner:', error);
+          resolve(imgUrl);
         }
-      }, 'image/jpeg', 0.8);
-    };
-    
-    img.onerror = function() {
-      console.warn('Failed to load banner image:', imgUrl);
-      resolve(imgUrl); // Fallback to original URL
-    };
-    
-    img.src = imgUrl;
+      })
+      .catch(() => {
+        // Fetch failed, try with Image element approach
+        console.log('Fetch failed, trying Image element approach for:', imgUrl);
+        
+        const img = new Image();
+        
+        // Try without crossOrigin first
+        img.onload = function() {
+          try {
+            // Try to create canvas with crossOrigin
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            
+            // Convert to blob
+            canvas.toBlob(async (blob) => {
+              try {
+                await setCachedBanner(username, imgUrl, blob);
+                const objectUrl = URL.createObjectURL(blob);
+                console.log('Successfully cached banner via canvas for:', username);
+                resolve(objectUrl);
+              } catch (error) {
+                console.warn('Failed to cache canvas banner:', error);
+                resolve(imgUrl);
+              }
+            }, 'image/jpeg', 0.8);
+          } catch (canvasError) {
+            // Canvas failed due to CORS, just use original URL
+            console.log('Canvas conversion failed due to CORS, using original URL for:', username);
+            resolve(imgUrl);
+          }
+        };
+        
+        img.onerror = function() {
+          console.warn('Failed to load banner image completely:', imgUrl);
+          // Try one more time with crossOrigin
+          const corsImg = new Image();
+          corsImg.crossOrigin = 'anonymous';
+          
+          corsImg.onload = function() {
+            try {
+              const canvas = document.createElement('canvas');
+              const ctx = canvas.getContext('2d');
+              canvas.width = corsImg.width;
+              canvas.height = corsImg.height;
+              ctx.drawImage(corsImg, 0, 0);
+              
+              canvas.toBlob(async (blob) => {
+                try {
+                  await setCachedBanner(username, imgUrl, blob);
+                  const objectUrl = URL.createObjectURL(blob);
+                  console.log('Successfully cached banner with CORS for:', username);
+                  resolve(objectUrl);
+                } catch (error) {
+                  console.warn('Failed to cache CORS banner:', error);
+                  resolve(imgUrl);
+                }
+              }, 'image/jpeg', 0.8);
+            } catch (corsError) {
+              console.log('CORS image also failed, using original URL for:', username);
+              resolve(imgUrl);
+            }
+          };
+          
+          corsImg.onerror = function() {
+            console.log('All image loading methods failed, using original URL for:', username);
+            resolve(imgUrl);
+          };
+          
+          corsImg.src = imgUrl;
+        };
+        
+        img.src = imgUrl;
+      });
   });
 }
 
@@ -129,19 +202,24 @@ async function replaceBanner(username, imgUrl) {
     let finalImgSrc = imgUrl;
     let shouldRevokeUrl = false;
     
-    // Check storage first
-    const cached = await getCachedBanner(username);
-    
-    if (cached && cached.url === imgUrl) {
-      // Use cached version
-      finalImgSrc = cached.dataUrl;
-      shouldRevokeUrl = cached.isBlob; // Only revoke if it's a blob URL
-      console.log('Using cached banner for:', username);
-    } else {
-      // Download and cache new banner
-      console.log('Downloading new banner for:', username);
-      finalImgSrc = await downloadAndCacheBanner(username, imgUrl);
-      shouldRevokeUrl = finalImgSrc.startsWith('blob:'); // Check if it's a blob URL
+    try {
+      // Check storage first
+      const cached = await getCachedBanner(username);
+      
+      if (cached && cached.url === imgUrl) {
+        // Use cached version
+        finalImgSrc = cached.dataUrl;
+        shouldRevokeUrl = cached.isBlob; // Only revoke if it's a blob URL
+        console.log('Using cached banner for:', username);
+      } else {
+        // Download and cache new banner
+        console.log('Downloading new banner for:', username);
+        finalImgSrc = await downloadAndCacheBanner(username, imgUrl);
+        shouldRevokeUrl = finalImgSrc.startsWith('blob:'); // Check if it's a blob URL
+      }
+    } catch (error) {
+      console.warn('Error in banner processing, using original URL:', error);
+      finalImgSrc = imgUrl; // Fallback to original URL
     }
     
     // Clean up previous blob URL if exists
@@ -180,6 +258,12 @@ function tryReplace(username) {
   
   if (!imgUrl) {
     // No custom banner for this user - restore original banner
+    restoreOriginalBanner();
+    return;
+  }
+  
+  if (!isValidImageUrl(imgUrl)) {
+    console.warn('Invalid image URL for user:', username, imgUrl);
     restoreOriginalBanner();
     return;
   }
